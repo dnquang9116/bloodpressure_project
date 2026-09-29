@@ -16,6 +16,12 @@ The monitor uses the oscillometric method. The cuff is first inflated to tempora
 
 ![Medical operating principle of oscillometric blood pressure measurement](image/operating_principle.png)
 
+# System Operating Principle
+
+![System block diagram](image/system.png)
+
+When a measurement is requested from the web interface, the Flask server makes a trigger available for the ESP32, which polls the server and sends the `START_MEASURE` command to the STM32 over UART. The STM32 reads cuff pressure from the HX710B, inflates the cuff to its target pressure, holds it briefly, and then deflates it at a controlled rate using PWM and a PI valve controller. During deflation, it tracks the heartbeat-induced pressure oscillations and builds an oscillometric envelope. A Bayesian estimator fits that envelope to estimate MAP, then derives systolic and diastolic pressure from the fitted curve; the firmware also checks the result quality. The measurements are shown on the ST7789 display and sent over UART to the ESP32, which uploads the completed SYS, DIA, and MAP results to the Flask server for the web interface to store and display. Afterward, the STM32 opens the valve to release the remaining cuff pressure.
+
 # Results
 
 The system measures cuff pressure and displays the estimated systolic pressure, diastolic pressure, and mean arterial pressure. The measured results are shown below.
