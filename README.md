@@ -7,13 +7,15 @@ This project is an automatic blood pressure monitoring system built around an **
 # Project Choices
 
 The **STM32F411** was selected to coordinate sensor readings, pressure control, display updates, and communication. The **HX710B** provides pressure measurements, while **the oscillometric method and a Bayesian estimator** are used to calculate blood pressure values. **A PWM-controlled valve** helps regulate cuff deflation, the **ST7789** provides a local user interface, and UART connects the STM32 to the ESP32.
+
+![Project hardware and design choices](image/project_choices.png)
+
 # Medical Operating Principle
 
 The monitor uses the oscillometric method. The cuff is first inflated to temporarily restrict blood flow, then slowly deflated. As blood begins flowing through the artery, each heartbeat creates small pressure oscillations in the cuff. The device analyzes these oscillations: their maximum amplitude is associated with mean arterial pressure, while systolic and diastolic pressures are estimated from the oscillation pattern using the device’s algorithm. These are device estimates and should not replace measurements or guidance from a healthcare professional.
 
 ![Medical operating principle of oscillometric blood pressure measurement](image/operating_principle.png)
 
-![Project hardware and design choices](image/project_choices.png)
 # Results
 
 The system measures cuff pressure and displays the estimated systolic pressure, diastolic pressure, and mean arterial pressure. The measured results are shown below.
