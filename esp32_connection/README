@@ -1,0 +1,4 @@
+<p align="center">
+  <strong><mark>BLOOD MEASUREMENT USING ESP32</mark></strong>
+</p>
+The **ESP32** acts as a communication bridge between the web server and the **STM32**. It check **the web server** for the measurement command every 500 milliseconds and sends it to the STM32 via **UART** (protocol). When it receives blood pressure readings, it processes the data and uploads the systolic, diastolic, and mean arterial pressure values to the web server over **Wi-Fi**

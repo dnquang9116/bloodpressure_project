@@ -1,0 +1,211 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+#include <ArduinoJson.h>
+
+// =========================================================================
+// 1. CẤU HÌNH WI-FI VÀ SERVER
+// =========================================================================
+const char* ssid        = "D2-408";
+const char* password    = "408804D2";
+const char* server_host = "192.168.2.37";
+const int   server_port = 5000;
+
+// =========================================================================
+// 2. CẤU HÌNH CHÂN UART — DÙNG CHÂN GỐC GPIO4 (RX) VÀ GPIO5 (TX)
+// =========================================================================
+#define ESP_RX_PIN 4    // RX của ESP32 nối vào TX của STM32
+#define ESP_TX_PIN 5    // TX của ESP32 nối vào RX của STM32
+
+HardwareSerial STM32Serial(2);  // Dùng UART2
+
+// =========================================================================
+// 3. BIẾN QUẢN LÝ
+// =========================================================================
+unsigned long lastCheckTime = 0;
+const unsigned long checkInterval = 500;  // Polling mỗi 500ms
+
+// Buffer tích lũy từng ký tự (không dùng readStringUntil)
+static String rxBuffer = "";
+
+// Kết quả huyết áp
+struct BPResult {
+  int  sys     = 0;
+  int  dia     = 0;
+  int  map     = 0;
+  int  quality = -1;   // -1=chưa có, 0=GOOD, 1=WARN, 2=BAD
+  bool valid   = false;
+};
+static BPResult bp;
+
+// =========================================================================
+// 4. PHÂN TÍCH TỪNG DÒNG NHẬN TỪ STM32
+// =========================================================================
+void parseLine(const String& line) {
+
+  /* --- Kết quả huyết áp: "SYS:120 DIA:80 MAP:93 Q:0" --- */
+  if (line.startsWith("SYS:")) {
+    int iSYS = line.indexOf("SYS:") + 4;
+    int iDIA = line.indexOf(" DIA:");
+    int iMAP = line.indexOf(" MAP:");
+    int iQ   = line.indexOf(" Q:");
+
+    if (iDIA < 0 || iMAP < 0 || iQ < 0) {
+      Serial.println("⚠️ [PARSE] -> Dòng SYS thiếu trường, bỏ qua.");
+      return;
+    }
+
+    bp.sys     = line.substring(iSYS,     iDIA  ).toInt();
+    bp.dia     = line.substring(iDIA + 5, iMAP  ).toInt();
+    bp.map     = line.substring(iMAP + 5, iQ    ).toInt();
+    bp.quality = line.substring(iQ   + 3        ).toInt();
+    bp.valid   = true;
+
+    const char* qStr[] = { "GOOD", "WARN", "BAD" };
+    Serial.println("\n===== KẾT QUẢ HUYẾT ÁP =====");
+    Serial.printf("  SYS : %d mmHg\n", bp.sys);
+    Serial.printf("  DIA : %d mmHg\n", bp.dia);
+    Serial.printf("  MAP : %d mmHg\n", bp.map);
+    if (bp.quality >= 0 && bp.quality <= 2)
+      Serial.printf("  Chất lượng: %s\n", qStr[bp.quality]);
+    Serial.println("=============================");
+
+    // Upload kết quả lên Flask server
+    uploadToServer();
+    return;
+  }
+
+  /* --- Áp suất định kỳ: "P=123.45 mmHg" --- */
+  if (line.startsWith("P=")) {
+    float p = line.substring(2, line.indexOf(' ')).toFloat();
+    Serial.printf("[RAW] P = %.2f mmHg\n", p);
+    return;
+  }
+
+  /* --- Các dòng debug khác từ STM32 --- */
+  Serial.print("[STM32] ");
+  Serial.println(line);
+}
+
+// =========================================================================
+// 5. GỬI KẾT QUẢ LÊN FLASK SERVER
+// =========================================================================
+void uploadToServer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ [UPLOAD] -> Mất Wi-Fi, không thể gửi dữ liệu.");
+    return;
+  }
+
+  HTTPClient http;
+  String recordUrl = "http://" + String(server_host) + ":" + String(server_port) + "/record/active";
+  http.begin(recordUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<200> jsonDoc;
+  jsonDoc["sys"] = bp.sys;
+  jsonDoc["dia"] = bp.dia;
+  jsonDoc["map"] = bp.map;
+
+  String jsonPayload;
+  serializeJson(jsonDoc, jsonPayload);
+
+  int httpCode = http.POST(jsonPayload);
+
+  if (httpCode == 200) {
+    Serial.println("🚀 [UPLOAD OK] -> Đã gửi kết quả lên Web thành công!");
+  } else {
+    Serial.printf("❌ [UPLOAD FAIL] -> Mã lỗi: %d\n", httpCode);
+  }
+  http.end();
+}
+
+// =========================================================================
+// 6. SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  // Khởi UART2: RX=GPIO4, TX=GPIO5
+  STM32Serial.begin(115200, SERIAL_8N1, ESP_RX_PIN, ESP_TX_PIN);
+
+  Serial.println("\n==================================================");
+  Serial.println("  HỆ THỐNG TRUNG CHUYỂN DỮ LIỆU ICU - ESP32-S3   ");
+  Serial.println("==================================================");
+
+  // Kết nối Wi-Fi
+  Serial.print("[Wi-Fi] -> Đang kết nối: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n[Wi-Fi] -> KẾT NỐI THÀNH CÔNG!");
+  Serial.print("[Wi-Fi] -> IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =========================================================================
+// 7. LOOP
+// =========================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // ---------------------------------------------------------------------------
+  // LUỒNG 1: HTTP POLLING — Hỏi server có lệnh START_MEASURE không (mỗi 500ms)
+  // ---------------------------------------------------------------------------
+  if (currentMillis - lastCheckTime >= checkInterval) {
+    lastCheckTime = currentMillis;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      String url = "http://" + String(server_host) + ":" + String(server_port) + "/api/check_trigger";
+      http.begin(url);
+
+      int httpCode = http.GET();
+
+      if (httpCode == 200) {
+        String payload = http.getString();
+
+        StaticJsonDocument<128> doc;
+        if (!deserializeJson(doc, payload)) {
+          bool hasTrigger = doc["trigger"] | false;
+          if (hasTrigger) {
+            Serial.println("\n🔔 [WEB] -> Bác sĩ nhấn BẮT ĐẦU ĐO!");
+            STM32Serial.println("START_MEASURE");
+            Serial.println("➔ [UART] -> Đã gửi 'START_MEASURE' sang STM32.");
+          }
+        }
+      } else {
+        Serial.printf("⚠️ [HTTP] -> Lỗi kết nối server. Mã: %d\n", httpCode);
+      }
+      http.end();
+
+    } else {
+      Serial.println("❌ [Wi-Fi] -> Mất kết nối! Đang kết nối lại...");
+      WiFi.begin(ssid, password);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // LUỒNG 2: Nhận dữ liệu từ STM32 — đọc từng byte, gom vào buffer đến '\n'
+  // ---------------------------------------------------------------------------
+  while (STM32Serial.available()) {
+    char c = (char)STM32Serial.read();
+
+    if (c == '\n') {
+      rxBuffer.trim();                          // Loại bỏ '\r' và khoảng trắng
+      if (rxBuffer.length() > 0) {
+        Serial.print("\n📥 [UART IN] -> ");
+        Serial.println(rxBuffer);
+        parseLine(rxBuffer);                    // Phân tích dòng vừa nhận
+      }
+      rxBuffer = "";                            // Reset cho dòng tiếp theo
+    } else {
+      rxBuffer += c;                            // Tích lũy ký tự
+    }
+  }
+}

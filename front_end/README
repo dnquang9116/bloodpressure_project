@@ -1,0 +1,5 @@
+<p align="center">
+  <strong><mark>The Web Sever</mark></strong>
+</p>
+ this code using **Flask** for **API and interface**. Also saving private information/result and push those into web server by **Socket.IO** in realtime. Generally, it manages patient records, receiver measurement requests from the web interface, and provides the **ESP32** with measurement commands. When blood pressure date arrives. It also streams live pressure readings to display 
+![reality image](web_server.jpg)

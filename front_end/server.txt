@@ -1,0 +1,225 @@
+from flask import Flask, request, jsonify, render_template
+from flask_cors import CORS
+from flask_socketio import SocketIO
+import os
+import shutil
+import time
+from datetime import datetime
+
+# Cấu hình thư mục chứa giao diện web nằm cùng cấp với file server.py
+app = Flask(__name__, template_folder="templates")
+CORS(app)
+
+# Ép cấu hình chạy luồng chuẩn "threading" của Windows ngay tại bước khởi tạo SocketIO để sửa triệt để lỗi NotImplementedError
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+patients = []
+active_patient_cccd = None 
+
+# Biến toàn cục dùng cho cơ chế HTTP Polling để ESP32 lấy lệnh đo nhanh
+is_trigger_clicked = False
+
+def load_all_patients_from_storage():
+    global patients
+    patients = []
+    if not os.path.exists(DATA_DIR): return
+
+    for folder_name in os.listdir(DATA_DIR):
+        folder_path = os.path.join(DATA_DIR, folder_name)
+        if os.path.isdir(folder_path) and "_" in folder_name:
+            parts = folder_name.split("_")
+            name = parts[0]
+            cccd = parts[1]
+            
+            patient = {
+                "name": name, "cccd": cccd, "dob": "Chưa rõ", "address": "Chưa rõ", "records": []
+            }
+            
+            file_list = sorted([f for f in os.listdir(folder_path) if f.endswith(".txt")])
+            for file_name in file_list:
+                file_path = os.path.join(folder_path, file_name)
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        record_data = {}
+                        for line in lines:
+                            if "DOB:" in line: patient["dob"] = line.split(":", 1)[1].strip()
+                            if "ADDRESS:" in line: patient["address"] = line.split(":", 1)[1].strip()
+                            if "SYS:" in line: record_data["sys"] = float(line.split(":", 1)[1].strip())
+                            if "DIA:" in line: record_data["dia"] = float(line.split(":", 1)[1].strip())
+                            # Đọc thông số MAP từ file lưu trữ cũ thay cho biến HR cũ
+                            if "MAP:" in line: record_data["map"] = float(line.split(":", 1)[1].strip())
+                            if "TIME:" in line: record_data["time"] = line.split(":", 1)[1].strip()
+                    
+                        if record_data:
+                            patient["records"].append(record_data)
+                except Exception as e:
+                    print(f"Lỗi khôi phục tệp {file_name}: {e}")
+            patients.append(patient)
+
+# Gọi hàm khôi phục toàn bộ database cục bộ khi khởi động Server
+load_all_patients_from_storage()
+
+# =========================================================================
+# ĐỊNH TUYẾN GIAO DIỆN WEB VÀ CÁC THÀNH PHẦN API
+# =========================================================================
+@app.route("/")
+def index():
+    # Trả về file index.html nằm trong thư mục templates khi gõ http://127.0.0.1:5000
+    return render_template("index.html")
+
+@app.route("/create_patient", methods=["POST"])
+def create():
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    cccd = data.get("cccd", "").strip()
+    dob = data.get("dob", "").strip() or "Chưa rõ"
+    address = data.get("address", "").strip() or "Chưa rõ"
+
+    if not name or not cccd:
+        return jsonify({"error": "Thiếu thông tin bắt buộc!"}), 400
+
+    if any(x for x in patients if x["cccd"] == cccd):
+        return jsonify({"error": "Mã CCCD định danh này đã tồn tại!"}), 400
+
+    patient = { "name": name, "cccd": cccd, "dob": dob, "address": address, "records": [] }
+    patients.append(patient)
+
+    folder = os.path.join(DATA_DIR, f"{name}_{cccd}")
+    os.makedirs(folder, exist_ok=True)
+    return jsonify({"msg": "ok"})
+
+@app.route("/patients", methods=["GET"])
+def get_patients():
+    return jsonify(patients)
+
+@app.route("/api/set_active_patient/<cccd>", methods=["POST"])
+def set_active_patient(cccd):
+    global active_patient_cccd
+    active_patient_cccd = cccd
+    print(f"-> Thiết lập bệnh nhân mục tiêu phục vụ đo nhanh: {active_patient_cccd}")
+    return jsonify({"msg": "active_set", "cccd": cccd})
+
+@app.route("/api/trigger_measure", methods=["POST"])
+def trigger():
+    global active_patient_cccd, is_trigger_clicked
+    data = request.json or {}
+    cccd = data.get("cccd") or active_patient_cccd
+    name = data.get("name", "Bệnh nhân")
+    
+    if not cccd:
+        return jsonify({"error": "Vui lòng chọn một bệnh nhân trên giao diện Web!"}), 400
+        
+    active_patient_cccd = cccd
+    is_trigger_clicked = True  # Đánh dấu trạng thái: Giao diện Web ĐÃ ẤN NÚT ĐO!
+    
+    print(f"⚡ Nhận lệnh từ Web: Kích hoạt đo cho bệnh nhân {name} ({cccd})")
+    
+    # Đồng thời phát qua kênh WebSocket (để giao diện Web chuyển trạng thái hiển thị nếu cần)
+    socketio.emit("hardware_trigger", {"cccd": cccd, "name": name})
+    return jsonify({"msg": "triggered"})
+
+# API: Cung cấp "Hộp thư" để ESP32 gửi HTTP GET lên kéo lệnh (Mỗi 0.5 giây)
+@app.route("/api/check_trigger", methods=["GET"])
+def check_trigger():
+    global is_trigger_clicked
+    # Nếu nút đo trên Web vừa được ấn, trả về true và lập tức reset trạng thái về false
+    if is_trigger_clicked:
+        is_trigger_clicked = False
+        return jsonify({"trigger": True})
+    return jsonify({"trigger": False})
+
+@app.route("/delete_patient/<cccd>", methods=["DELETE"])
+def delete_patient(cccd):
+    global patients, active_patient_cccd
+    p = next((x for x in patients if x["cccd"] == cccd), None)
+    if not p:
+        return jsonify({"error": "Không tìm thấy hồ sơ!"}), 404
+
+    folder_name = f"{p['name']}_{p['cccd']}"
+    folder_path = os.path.join(DATA_DIR, folder_name)
+    if os.path.exists(folder_path):
+        shutil.rmtree(folder_path)
+
+    patients = [x for x in patients if x["cccd"] != cccd]
+    if active_patient_cccd == cccd:
+        active_patient_cccd = None
+        
+    return jsonify({"msg": "ok"})
+
+@app.route("/record/<cccd>", methods=["POST"])
+def record(cccd):
+    global active_patient_cccd, patients
+    data = request.json or {}
+    
+    # BÓC TÁCH THÔNG SỐ (Hỗ trợ cả 'hr' từ bản giao diện cũ và 'map' từ bản phần cứng mới)
+    sys_val = float(data.get("sys", 0))
+    dia_val = float(data.get("dia", 0))
+    map_val = float(data.get("map", 0))
+    hr_val = float(data.get("hr", 0))
+    
+    # Nếu bản vẽ giao diện web cũ cần 'hr', mà mạch gửi 'map', ta lấy map làm nhịp tim tạm thời để test đồ thị
+    if hr_val == 0 and map_val != 0:
+        hr_val = map_val
+
+    target_cccd = active_patient_cccd if cccd == "active" else cccd
+    
+    # CƠ CHẾ CHỐNG LỖI 404: Nếu chưa chọn bệnh nhân, tự động gán vào một bệnh nhân mặc định
+    if not target_cccd or not any(x for x in patients if x["cccd"] == target_cccd):
+        target_cccd = "000000"
+        if not any(x for x in patients if x["cccd"] == target_cccd):
+            test_patient = {
+                "name": "Bệnh nhân Khẩn cấp", 
+                "cccd": target_cccd, 
+                "dob": "Chưa rõ", 
+                "address": "Cấp cứu", 
+                "records": []
+            }
+            patients.append(test_patient)
+            os.makedirs(os.path.join(DATA_DIR, f"BenhNhanKhanCap_{target_cccd}"), exist_ok=True)
+        active_patient_cccd = target_cccd
+
+    p = next((x for x in patients if x["cccd"] == target_cccd), None)
+    now = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    
+    r = {
+        "sys": sys_val,
+        "dia": dia_val,
+        "hr": hr_val,  # Giữ lại hr để đồng bộ với đồ thị index.html cũ của bạn
+        "map": map_val,
+        "time": now
+    }
+    p["records"].append(r)
+
+    folder = os.path.join(DATA_DIR, f"{p['name']}_{p['cccd']}")
+    file = os.path.join(folder, f"{now}.txt")
+
+    try:
+        with open(file, "w", encoding="utf-8") as f:
+            f.write(f"TEN: {p['name']}\nCCCD: {p['cccd']}\n")
+            f.write(f"TIME: {now}\nSYS: {r['sys']}\nDIA: {r['dia']}\nMAP: {r['map']}\nHR: {r['hr']}\n")
+    except Exception as e:
+        print(f"Lỗi ghi dữ liệu tệp văn bản: {e}")
+
+    # Phát socket dội lên Web đồng thời cho cả cấu trúc cũ (hr) và cấu trúc mới
+    socketio.emit("newData", {"cccd": target_cccd, "data": r})
+    print(f"➔ [SUCCESS] Đã lưu bản ghi đo cho {p['name']}: SYS:{sys_val}, DIA:{dia_val}, MAP/HR:{hr_val}")
+    return jsonify({"msg": "ok", "saved_cccd": target_cccd})
+
+
+# SỬA LỖI 404 ĐƯỜNG DẪN LIVE_PRESSURE (Gộp chung định tuyến tránh trùng hàm)
+@app.route("/api/live_pressure", methods=["POST"])
+@app.route("/live_pressure", methods=["POST"])
+def live_pressure():
+    # Hỗ trợ nhận dữ liệu áp suất xả tức thời để Web hiển thị đồ thị nén khí dạng realtime
+    data = request.json or {}
+    p_val = data.get("pressure", 0)
+    socketio.emit("live_pressure_update", {"pressure": p_val})
+    return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    # Chạy trên tất cả card mạng (0.0.0.0) cổng số 5000 để ESP32 kết nối mạng cục bộ thành công
+    socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
